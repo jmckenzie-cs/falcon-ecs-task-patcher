@@ -1,19 +1,28 @@
 import { spawn } from 'child_process';
-import { readConfig } from './config.js';
+import { writeFileSync, mkdtempSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 const LOG_CAP = 10_000;
 
+// Fields that must be stripped before passing a described task def to the patching utility
+// or to register-task-definition (ECS rejects them as read-only).
+const STRIP_FIELDS = [
+  'taskDefinitionArn', 'revision', 'status', 'requiresAttributes',
+  'compatibilities', 'registeredAt', 'registeredBy', 'tags',
+];
+
 export function appendLog(job, line) {
-  if (job.logs.length >= LOG_CAP) {
-    job.logs.shift();
-  }
+  if (job.logs.length >= LOG_CAP) job.logs.shift();
   job.logs.push(line);
   job.emitter.emit('log', { line });
 }
 
-function spawnAws(args, cfg) {
+// ── AWS CLI helpers ──────────────────────────────────────────────────────────
+
+function spawnAws(args, cfg, raw = false) {
   const { awsRegion, awsProfile } = cfg;
-  const fullArgs = [...args, '--output', 'json'];
+  const fullArgs = raw ? [...args] : [...args, '--output', 'json'];
   if (awsRegion) fullArgs.push('--region', awsRegion);
   if (awsProfile) fullArgs.push('--profile', awsProfile);
 
@@ -21,108 +30,142 @@ function spawnAws(args, cfg) {
     const child = spawn('aws', fullArgs);
     let stdout = '';
     let stderr = '';
-
     child.stdout.on('data', d => { stdout += d.toString(); });
     child.stderr.on('data', d => { stderr += d.toString(); });
-
     child.on('close', code => {
       if (code !== 0) {
         reject(new Error(stderr.trim() || `aws CLI exited with code ${code}`));
+      } else if (raw) {
+        resolve(stdout.trim());
       } else {
-        try {
-          resolve(stdout.trim() ? JSON.parse(stdout) : {});
-        } catch {
-          reject(new Error(`Failed to parse AWS CLI output: ${stdout.slice(0, 200)}`));
-        }
+        try { resolve(stdout.trim() ? JSON.parse(stdout) : {}); }
+        catch { reject(new Error(`Failed to parse AWS CLI output: ${stdout.slice(0, 200)}`)); }
       }
     });
-
     child.on('error', err => {
-      if (err.code === 'ENOENT') {
-        reject(new Error('aws CLI not found — install the AWS CLI and ensure it is in your PATH'));
-      } else {
-        reject(err);
-      }
+      reject(err.code === 'ENOENT'
+        ? new Error('aws CLI not found — install the AWS CLI and ensure it is in your PATH')
+        : err);
     });
   });
 }
 
+// ── ECR pull token ───────────────────────────────────────────────────────────
+
+async function getEcrPullToken(cfg) {
+  const registry = cfg.falconSensorImage.split('/')[0];
+  if (!registry.includes('.dkr.ecr.')) return null;
+  const password = await spawnAws(['ecr', 'get-login-password'], cfg, true);
+  const auth = Buffer.from(`AWS:${password}`).toString('base64');
+  const dockerConfig = JSON.stringify({ auths: { [registry]: { auth } } });
+  return Buffer.from(dockerConfig).toString('base64');
+}
+
+// ── CrowdStrike patching utility (runs inside the sensor image via docker) ───
+
+async function runPatchingUtility(taskDef, cfg, log = () => {}) {
+  // Write sanitised task def to a temp dir that gets bind-mounted into the container
+  const tmpDir = mkdtempSync(join(tmpdir(), 'falcon-patch-'));
+  const specPath = join(tmpDir, 'taskdef.json');
+
+  const sanitised = Object.fromEntries(
+    Object.entries(taskDef).filter(([k]) => !STRIP_FIELDS.includes(k)),
+  );
+  writeFileSync(specPath, JSON.stringify(sanitised));
+
+  // Build docker args
+  const args = [
+    'run', '--rm',
+    '-v', `${tmpDir}:/var/run/spec`,
+    cfg.falconSensorImage,
+    '-cid', cfg.falconCid,
+    '-image', cfg.falconSensorImage,
+    '-ecs-spec-file', '/var/run/spec/taskdef.json',
+  ];
+
+  // Pull token lets the utility inspect private app-container images for their ENTRYPOINT/CMD
+  try {
+    const pullToken = await getEcrPullToken(cfg);
+    if (pullToken) args.push('-pulltoken', pullToken);
+  } catch { /* no token — public images will still work */ }
+
+  if (cfg.falconctlOpts) args.push('--falconctl-opts', cfg.falconctlOpts);
+
+  log(`[patcher] Running CrowdStrike patching utility (docker)...`);
+
+  return new Promise((resolve, reject) => {
+    const child = spawn('docker', args);
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', d => { stdout += d.toString(); });
+    child.stderr.on('data', d => {
+      stderr += d.toString();
+      // Surface docker / utility progress to the job log
+      d.toString().split('\n').filter(Boolean).forEach(line => log(`[docker] ${line}`));
+    });
+    child.on('close', code => {
+      if (code !== 0) {
+        reject(new Error(stderr.trim() || `Patching utility exited with code ${code}`));
+      } else {
+        try { resolve(JSON.parse(stdout.trim())); }
+        catch { reject(new Error(`Patching utility produced invalid JSON: ${stdout.slice(0, 200)}`)); }
+      }
+    });
+    child.on('error', err => {
+      reject(err.code === 'ENOENT'
+        ? new Error('docker not found — install Docker and ensure it is in your PATH')
+        : err);
+    });
+  });
+}
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
 export async function patchTaskDefinition(job, cfg) {
   const { taskDefArn } = job;
 
-  if (!cfg.falconSensorImage) {
-    throw new Error('Falcon Sensor Image URI is not configured — open Settings and set it before patching.');
-  }
-  if (!cfg.falconCid) {
-    throw new Error('Falcon CID is not configured — open Settings and set it before patching.');
-  }
+  if (!cfg.falconSensorImage) throw new Error('Falcon Sensor Image URI is not configured.');
+  if (!cfg.falconCid) throw new Error('Falcon CID is not configured.');
 
   appendLog(job, `[patcher] Describing task definition: ${taskDefArn}`);
 
-  // Fetch current task definition
   const describeResult = await spawnAws(
     ['ecs', 'describe-task-definition', '--task-definition', taskDefArn, '--include', 'TAGS'],
     cfg,
   );
-
   const original = describeResult.taskDefinition;
   const originalTags = describeResult.tags || [];
 
-  appendLog(job, `[patcher] Found task definition family: ${original.family}, revision: ${original.revision}`);
-  appendLog(job, `[patcher] Container count: ${original.containerDefinitions.length}`);
+  appendLog(job, `[patcher] Family: ${original.family}, revision: ${original.revision}, containers: ${original.containerDefinitions.length}`);
 
-  // Check if already patched
-  const alreadyPatched = original.containerDefinitions.some(
-    c => c.name === cfg.containerName,
-  );
+  const alreadyPatched = original.containerDefinitions.some(c => c.name === 'crowdstrike-falcon-init-container');
   if (alreadyPatched) {
-    throw new Error(`Task definition already contains a container named "${cfg.containerName}". Deregister the existing patched revision first.`);
+    throw new Error('Task definition is already patched (crowdstrike-falcon-init-container found).');
   }
 
-  const needsTmpVolumes = original.containerDefinitions.some(c => c.readonlyRootFilesystem === true);
-  if (needsTmpVolumes) {
-    appendLog(job, `[patcher] Detected readonlyRootFilesystem — injecting writable /tmp mounts for Falcon sensor`);
-  }
-
-  // Build Falcon sidecar container definition
-  const falconContainer = buildFalconContainer(cfg, original, needsTmpVolumes);
-  appendLog(job, `[patcher] Injecting Falcon container: ${falconContainer.name} (image: ${falconContainer.image})`);
-
-  // Build updated container definitions — inject Falcon first
-  const updatedContainers = [falconContainer, ...original.containerDefinitions.map(c => injectFalconVolume(c, cfg, needsTmpVolumes))];
-
-  // Build new task definition request
-  const registerInput = buildRegisterInput(original, updatedContainers, cfg, needsTmpVolumes);
+  // Run the CrowdStrike patching utility — it outputs the patched register-task-definition JSON
+  const patched = await runPatchingUtility(original, cfg, line => appendLog(job, line));
 
   appendLog(job, `[patcher] Registering new task definition revision...`);
 
-  // Write register input to a temp file to avoid shell escaping issues
-  const { writeFileSync } = await import('fs');
-  const { tmpdir } = await import('os');
-  const { join } = await import('path');
-  const tmpFile = join(tmpdir(), `falcon-ecs-patch-${job.id}.json`);
-  writeFileSync(tmpFile, JSON.stringify(registerInput));
+  const tmpFile = join(tmpdir(), `falcon-ecs-register-${job.id}.json`);
+  writeFileSync(tmpFile, JSON.stringify(patched));
 
   const registerResult = await spawnAws(
     ['ecs', 'register-task-definition', '--cli-input-json', `file://${tmpFile}`],
     cfg,
   );
 
-  // Clean up temp file
-  try {
-    const { unlinkSync } = await import('fs');
-    unlinkSync(tmpFile);
-  } catch { /* ignore */ }
+  try { (await import('fs')).unlinkSync(tmpFile); } catch { /* ignore */ }
 
   const newTd = registerResult.taskDefinition;
-  job.newTaskDefArn = `${newTd.taskDefinitionArn}`;
+  job.newTaskDefArn = newTd.taskDefinitionArn;
   job.newRevision = newTd.revision;
 
   appendLog(job, `[patcher] Registered: ${newTd.taskDefinitionArn}`);
 
-  // Re-apply tags if present
   if (originalTags.length > 0) {
-    appendLog(job, `[patcher] Copying ${originalTags.length} tag(s) to new revision...`);
+    appendLog(job, `[patcher] Copying ${originalTags.length} tag(s)...`);
     await spawnAws(
       ['ecs', 'tag-resource', '--resource-arn', newTd.taskDefinitionArn,
         '--tags', ...originalTags.map(t => `key=${t.key},value=${t.value}`)],
@@ -133,115 +176,13 @@ export async function patchTaskDefinition(job, cfg) {
   appendLog(job, `[patcher] Patch complete. New ARN: ${newTd.taskDefinitionArn}`);
 }
 
-// Pure patch — works on a plain task definition object, no AWS calls.
-// Returns the register-task-definition input object (patched task def).
-export function applyPatch(taskDefinition, cfg) {
-  const alreadyPatched = taskDefinition.containerDefinitions.some(
-    c => c.name === (cfg.containerName || 'falcon-sensor'),
-  );
-  if (alreadyPatched) {
-    throw new Error(`Task definition already contains a container named "${cfg.containerName || 'falcon-sensor'}".`);
-  }
-  const needsTmpVolumes = taskDefinition.containerDefinitions.some(c => c.readonlyRootFilesystem === true);
-  const falconContainer = buildFalconContainer(cfg, taskDefinition, needsTmpVolumes);
-  const updatedContainers = [falconContainer, ...taskDefinition.containerDefinitions.map(c => injectFalconVolume(c, cfg, needsTmpVolumes))];
-  return buildRegisterInput(taskDefinition, updatedContainers, cfg, needsTmpVolumes);
-}
+// Pure patch — no AWS calls. Used by the file-upload flow.
+export async function applyPatch(taskDefinition, cfg) {
+  if (!cfg.falconSensorImage) throw new Error('falconSensorImage not configured.');
+  if (!cfg.falconCid) throw new Error('falconCid not configured.');
 
-function buildFalconContainer(cfg, original, needsTmpVolumes) {
-  // The Falcon container sensor runs as a persistent sidecar via /entrypoint.sh.
-  // It does not use an init-container pattern — no command override, no shared volume.
-  const container = {
-    name: cfg.containerName || 'falcon-sensor',
-    image: cfg.falconSensorImage,
-    essential: false,
-    user: '0:0',
-    environment: [],
-  };
+  const alreadyPatched = taskDefinition.containerDefinitions.some(c => c.name === 'crowdstrike-falcon-init-container');
+  if (alreadyPatched) throw new Error('Task definition is already patched.');
 
-  if (cfg.falconCid) {
-    container.environment.push({ name: 'FALCONCTL_OPT_CID', value: cfg.falconCid });
-  }
-
-  if (cfg.falconctlOpts) {
-    container.environment.push({ name: 'FALCONCTL_OPT_OPTS', value: cfg.falconctlOpts });
-  }
-
-  // When app containers use readonlyRootFilesystem, mount writable ephemeral volumes
-  // for the paths the Falcon sensor writes to at runtime.
-  if (needsTmpVolumes) {
-    container.mountPoints = [
-      { sourceVolume: 'falcon-tmp-private', containerPath: '/tmp/CrowdStrike-private', readOnly: false },
-      { sourceVolume: 'falcon-tmp',         containerPath: '/tmp/CrowdStrike',         readOnly: false },
-    ];
-  }
-
-  return container;
-}
-
-function injectFalconVolume(container, cfg, needsTmpVolumes) {
-  const updated = { ...container };
-
-  // Add depends-on so app containers wait for the sensor sidecar to start
-  updated.dependsOn = [
-    ...(container.dependsOn || []),
-    {
-      containerName: cfg.containerName || 'falcon-sensor',
-      condition: 'START',
-    },
-  ];
-
-  // For containers with a read-only root filesystem, punch writable mounts through
-  // for the specific paths the Falcon sensor needs at runtime.
-  if (needsTmpVolumes && container.readonlyRootFilesystem) {
-    updated.mountPoints = [
-      ...(container.mountPoints || []),
-      { sourceVolume: 'falcon-tmp-private', containerPath: '/tmp/CrowdStrike-private', readOnly: false },
-      { sourceVolume: 'falcon-tmp',         containerPath: '/tmp/CrowdStrike',         readOnly: false },
-    ];
-  }
-
-  return updated;
-}
-
-function buildRegisterInput(original, updatedContainers, cfg, needsTmpVolumes) {
-  // Copy fields that are valid for register-task-definition
-  const allowed = [
-    'family',
-    'taskRoleArn',
-    'executionRoleArn',
-    'networkMode',
-    'cpu',
-    'memory',
-    'requiresCompatibilities',
-    'pidMode',
-    'ipcMode',
-    'proxyConfiguration',
-    'inferenceAccelerators',
-    'ephemeralStorage',
-    'runtimePlatform',
-  ];
-
-  const input = {};
-  for (const key of allowed) {
-    if (original[key] !== undefined && original[key] !== null) {
-      input[key] = original[key];
-    }
-  }
-
-  input.containerDefinitions = updatedContainers;
-
-  // Build volumes list — preserve originals, add ephemeral tmp volumes if needed
-  const originalVolumes = (original.volumes || []);
-  if (needsTmpVolumes) {
-    input.volumes = [
-      ...originalVolumes.filter(v => v.name !== 'falcon-tmp-private' && v.name !== 'falcon-tmp'),
-      { name: 'falcon-tmp-private' },
-      { name: 'falcon-tmp' },
-    ];
-  } else if (originalVolumes.length > 0) {
-    input.volumes = originalVolumes;
-  }
-
-  return input;
+  return runPatchingUtility(taskDefinition, cfg);
 }
