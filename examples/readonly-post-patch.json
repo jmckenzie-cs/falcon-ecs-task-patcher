@@ -1,0 +1,112 @@
+{
+  "family": "alpine-webapp-readonly",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "alpine-webapp",
+      "image": "<AWS_ACCOUNT_ID>.dkr.ecr.<AWS_REGION>.amazonaws.com/<IMAGE_REPO>:<IMAGE_TAG>",
+      "essential": true,
+      "readonlyRootFilesystem": true,
+      "portMappings": [
+        {
+          "containerPort": 80,
+          "hostPort": 80,
+          "protocol": "tcp"
+        }
+      ],
+      "dependsOn": [
+        {
+          "containerName": "crowdstrike-falcon-init-container",
+          "condition": "COMPLETE"
+        }
+      ],
+      "entryPoint": [
+        "/tmp/CrowdStrike/rootfs/lib64/ld-linux-x86-64.so.2",
+        "--library-path",
+        "/tmp/CrowdStrike/rootfs/lib64",
+        "/tmp/CrowdStrike/rootfs/bin/bash",
+        "/tmp/CrowdStrike/rootfs/entrypoint-ecs.sh",
+        "/docker-entrypoint.sh",
+        "nginx",
+        "-g",
+        "daemon off;"
+      ],
+      "environment": [
+        {
+          "name": "FALCONCTL_OPTS",
+          "value": "--cid=<FALCON_CID>"
+        }
+      ],
+      "linuxParameters": {
+        "capabilities": {
+          "add": ["SYS_PTRACE"]
+        }
+      },
+      "mountPoints": [
+        {
+          "sourceVolume": "nginx-cache",
+          "containerPath": "/var/cache/nginx",
+          "readOnly": false
+        },
+        {
+          "sourceVolume": "nginx-run",
+          "containerPath": "/var/run",
+          "readOnly": false
+        },
+        {
+          "sourceVolume": "crowdstrike-falcon-volume",
+          "containerPath": "/tmp/CrowdStrike",
+          "readOnly": true
+        },
+        {
+          "sourceVolume": "crowdstrike-private-alpine-webapp",
+          "containerPath": "/tmp/CrowdStrike-private",
+          "readOnly": false
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/alpine-webapp-readonly",
+          "awslogs-region": "<AWS_REGION>",
+          "awslogs-stream-prefix": "ecs",
+          "awslogs-create-group": "true"
+        }
+      }
+    },
+    {
+      "name": "crowdstrike-falcon-init-container",
+      "image": "<AWS_ACCOUNT_ID>.dkr.ecr.<AWS_REGION>.amazonaws.com/<FALCON_SENSOR_REPO>:<FALCON_SENSOR_TAG>",
+      "essential": false,
+      "user": "0:0",
+      "readonlyRootFilesystem": true,
+      "entryPoint": [
+        "/bin/bash",
+        "-c",
+        "chmod u+rwx /tmp/CrowdStrike && mkdir -p /tmp/CrowdStrike/rootfs/lib && cp -r /bin /etc /lib64 /usr /entrypoint-ecs.sh /tmp/CrowdStrike/rootfs && chmod -R a=rX /tmp/CrowdStrike && chmod -R a=rwX /tmp/CrowdStrike-private-alpine-webapp"
+      ],
+      "mountPoints": [
+        {
+          "sourceVolume": "crowdstrike-falcon-volume",
+          "containerPath": "/tmp/CrowdStrike",
+          "readOnly": false
+        },
+        {
+          "sourceVolume": "crowdstrike-private-alpine-webapp",
+          "containerPath": "/tmp/CrowdStrike-private-alpine-webapp",
+          "readOnly": false
+        }
+      ]
+    }
+  ],
+  "volumes": [
+    { "name": "nginx-cache" },
+    { "name": "nginx-run" },
+    { "name": "crowdstrike-falcon-volume" },
+    { "name": "crowdstrike-private-alpine-webapp" }
+  ]
+}
