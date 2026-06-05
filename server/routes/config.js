@@ -1,7 +1,14 @@
 import express from 'express';
+import os from 'os';
 import { readConfig, writeConfig } from '../config.js';
 
 const router = express.Router();
+
+router.get('/system', (_req, res) => {
+  const platform = os.platform(); // 'darwin' | 'linux' | 'win32'
+  const arch = os.arch();         // 'arm64' | 'x64' | ...
+  res.json({ platform, arch });
+});
 
 router.get('/', (_req, res) => {
   const cfg = readConfig();

@@ -1,14 +1,40 @@
 import { useState, useEffect, useCallback } from 'react';
-import { fetchJobs, clearJobs } from './api.js';
+import { fetchJobs, clearJobs, fetchSystemInfo } from './api.js';
 import ConfigPanel from './components/ConfigPanel.jsx';
 import DropZone from './components/DropZone.jsx';
 import FilePatcher from './components/FilePatcher.jsx';
 import JobTable from './components/JobTable.jsx';
 
+function PlatformNotice({ platform, arch }) {
+  if (arch === 'arm64' && platform === 'darwin') {
+    return (
+      <div className="bg-yellow-900/40 border border-yellow-700/60 rounded-lg px-4 py-3 text-sm text-yellow-300 flex items-start gap-3">
+        <span className="mt-0.5 shrink-0">⚠</span>
+        <span>
+          <strong>Apple Silicon detected</strong> — the patching utility runs via amd64 emulation (Rosetta).
+          Ensure your sensor image is pulled as <code className="font-mono bg-yellow-900/50 px-1 rounded">linux/amd64</code> and app container images are built for <code className="font-mono bg-yellow-900/50 px-1 rounded">linux/amd64</code>.
+        </span>
+      </div>
+    );
+  }
+  if (platform === 'win32') {
+    return (
+      <div className="bg-yellow-900/40 border border-yellow-700/60 rounded-lg px-4 py-3 text-sm text-yellow-300 flex items-start gap-3">
+        <span className="mt-0.5 shrink-0">⚠</span>
+        <span>
+          <strong>Windows detected</strong> — Docker Desktop with WSL2 is required. Ensure Docker is running and WSL2 integration is enabled. App container images must be built for <code className="font-mono bg-yellow-900/50 px-1 rounded">linux/amd64</code>.
+        </span>
+      </div>
+    );
+  }
+  return null;
+}
+
 export default function App() {
   const [jobs, setJobs] = useState([]);
   const [configOpen, setConfigOpen] = useState(false);
   const [tab, setTab] = useState('aws'); // 'aws' | 'file'
+  const [systemInfo, setSystemInfo] = useState(null);
 
   const refreshJobs = useCallback(async () => {
     try {
@@ -24,6 +50,10 @@ export default function App() {
     const id = setInterval(refreshJobs, 2000);
     return () => clearInterval(id);
   }, [refreshJobs]);
+
+  useEffect(() => {
+    fetchSystemInfo().then(setSystemInfo).catch(() => {});
+  }, []);
 
   const handleClear = async () => {
     await clearJobs();
@@ -47,6 +77,7 @@ export default function App() {
       </header>
 
       <main className="max-w-5xl mx-auto px-6 py-8 space-y-8">
+        {systemInfo && <PlatformNotice platform={systemInfo.platform} arch={systemInfo.arch} />}
         {/* Mode tabs */}
         <div className="flex gap-1 border-b border-gray-800 pb-0">
           {[['aws', '☁ Patch via AWS'], ['file', '📄 Patch a file']].map(([key, label]) => (

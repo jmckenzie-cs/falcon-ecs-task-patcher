@@ -1,3 +1,9 @@
+export async function fetchSystemInfo() {
+  const res = await fetch('/api/config/system');
+  if (!res.ok) throw new Error('Failed to fetch system info');
+  return res.json();
+}
+
 export async function detectFalconConfig(falconClientId, falconClientSecret, falconCloud) {
   const res = await fetch('/api/config/detect', {
     method: 'POST',
