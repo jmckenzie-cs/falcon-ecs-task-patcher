@@ -1,11 +1,11 @@
 import { useState, useEffect } from 'react';
-import { fetchConfig, saveConfig } from '../api.js';
+import { fetchConfig, saveConfig, detectFalconConfig } from '../api.js';
 
 const FIELDS = [
   { key: 'falconClientId', label: 'Falcon Client ID', type: 'text' },
   { key: 'falconClientSecret', label: 'Falcon Client Secret', type: 'password' },
   { key: 'falconCid', label: 'Falcon CID', type: 'text', placeholder: 'ABC123...-AB' },
-  { key: 'falconSensorImage', label: 'Falcon Sensor Image URI', type: 'text', placeholder: 'registry.crowdstrike.com/falcon-sensor/...' },
+  { key: 'falconSensorImage', label: 'Falcon Sensor Image URI', type: 'text', placeholder: 'registry.crowdstrike.com/falcon-container/...' },
   { key: 'containerName', label: 'Falcon Container Name', type: 'text', placeholder: 'falcon-sensor' },
   { key: 'falconctlOpts', label: 'falconctl Options', type: 'text', placeholder: 'Optional extra flags' },
   { key: 'awsRegion', label: 'AWS Region', type: 'text', placeholder: 'us-east-1' },
@@ -17,6 +17,8 @@ export default function ConfigPanel({ onClose }) {
   const [form, setForm] = useState({});
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [detecting, setDetecting] = useState(false);
+  const [detectError, setDetectError] = useState('');
   const [error, setError] = useState('');
 
   useEffect(() => {
@@ -25,6 +27,29 @@ export default function ConfigPanel({ onClose }) {
 
   const handleChange = (key, value) => {
     setForm(f => ({ ...f, [key]: value }));
+  };
+
+  const handleDetect = async () => {
+    const id = form.falconClientId;
+    const secret = form.falconClientSecret;
+    if (!id || !secret || secret === '***') {
+      setDetectError('Enter Client ID and Secret first');
+      return;
+    }
+    setDetecting(true);
+    setDetectError('');
+    try {
+      const detected = await detectFalconConfig(id, secret);
+      setForm(f => ({
+        ...f,
+        falconCid: detected.falconCid ?? f.falconCid,
+        falconSensorImage: detected.falconSensorImage ?? f.falconSensorImage,
+      }));
+    } catch (e) {
+      setDetectError(e.message);
+    } finally {
+      setDetecting(false);
+    }
   };
 
   const handleSave = async () => {
@@ -43,10 +68,8 @@ export default function ConfigPanel({ onClose }) {
 
   return (
     <div className="fixed inset-0 z-50 flex">
-      {/* Backdrop */}
       <div className="flex-1 bg-black/50" onClick={onClose} />
 
-      {/* Drawer */}
       <div className="w-full max-w-md bg-gray-900 border-l border-gray-700 flex flex-col overflow-hidden">
         <div className="flex items-center justify-between px-6 py-4 border-b border-gray-700">
           <h2 className="font-semibold text-base">Settings</h2>
@@ -66,6 +89,18 @@ export default function ConfigPanel({ onClose }) {
               />
             </div>
           ))}
+
+          {/* Auto-detect */}
+          <div className="pt-1">
+            <button
+              onClick={handleDetect}
+              disabled={detecting}
+              className="w-full px-3 py-2 bg-gray-800 hover:bg-gray-700 disabled:opacity-50 border border-gray-600 rounded text-sm transition-colors text-gray-300"
+            >
+              {detecting ? 'Detecting...' : '⚡ Auto-detect CID & sensor image from credentials'}
+            </button>
+            {detectError && <p className="text-red-400 text-xs mt-1">{detectError}</p>}
+          </div>
         </div>
 
         <div className="px-6 py-4 border-t border-gray-700 flex items-center gap-3">
@@ -83,3 +118,5 @@ export default function ConfigPanel({ onClose }) {
     </div>
   );
 }
+
+
