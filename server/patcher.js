@@ -79,15 +79,20 @@ export async function patchTaskDefinition(job, cfg) {
     throw new Error(`Task definition already contains a container named "${cfg.containerName}". Deregister the existing patched revision first.`);
   }
 
-  // Build Falcon init container definition
-  const falconContainer = buildFalconContainer(cfg, original);
+  const needsTmpVolumes = original.containerDefinitions.some(c => c.readonlyRootFilesystem === true);
+  if (needsTmpVolumes) {
+    appendLog(job, `[patcher] Detected readonlyRootFilesystem — injecting writable /tmp mounts for Falcon sensor`);
+  }
+
+  // Build Falcon sidecar container definition
+  const falconContainer = buildFalconContainer(cfg, original, needsTmpVolumes);
   appendLog(job, `[patcher] Injecting Falcon container: ${falconContainer.name} (image: ${falconContainer.image})`);
 
   // Build updated container definitions — inject Falcon first
-  const updatedContainers = [falconContainer, ...original.containerDefinitions.map(c => injectFalconVolume(c, cfg))];
+  const updatedContainers = [falconContainer, ...original.containerDefinitions.map(c => injectFalconVolume(c, cfg, needsTmpVolumes))];
 
   // Build new task definition request
-  const registerInput = buildRegisterInput(original, updatedContainers, cfg);
+  const registerInput = buildRegisterInput(original, updatedContainers, cfg, needsTmpVolumes);
 
   appendLog(job, `[patcher] Registering new task definition revision...`);
 
@@ -137,29 +142,21 @@ export function applyPatch(taskDefinition, cfg) {
   if (alreadyPatched) {
     throw new Error(`Task definition already contains a container named "${cfg.containerName || 'falcon-sensor'}".`);
   }
-  const falconContainer = buildFalconContainer(cfg, taskDefinition);
-  const updatedContainers = [falconContainer, ...taskDefinition.containerDefinitions.map(c => injectFalconVolume(c, cfg))];
-  return buildRegisterInput(taskDefinition, updatedContainers, cfg);
+  const needsTmpVolumes = taskDefinition.containerDefinitions.some(c => c.readonlyRootFilesystem === true);
+  const falconContainer = buildFalconContainer(cfg, taskDefinition, needsTmpVolumes);
+  const updatedContainers = [falconContainer, ...taskDefinition.containerDefinitions.map(c => injectFalconVolume(c, cfg, needsTmpVolumes))];
+  return buildRegisterInput(taskDefinition, updatedContainers, cfg, needsTmpVolumes);
 }
 
-function buildFalconContainer(cfg, original) {
-  // Determine shared memory volume name
-  const volumeName = 'falconshm';
-
+function buildFalconContainer(cfg, original, needsTmpVolumes) {
+  // The Falcon container sensor runs as a persistent sidecar via /entrypoint.sh.
+  // It does not use an init-container pattern — no command override, no shared volume.
   const container = {
     name: cfg.containerName || 'falcon-sensor',
     image: cfg.falconSensorImage,
     essential: false,
     user: '0:0',
     environment: [],
-    mountPoints: [
-      {
-        sourceVolume: volumeName,
-        containerPath: '/opt/CrowdStrike',
-        readOnly: false,
-      },
-    ],
-    command: ['falconctl', 'install'],
   };
 
   if (cfg.falconCid) {
@@ -167,40 +164,47 @@ function buildFalconContainer(cfg, original) {
   }
 
   if (cfg.falconctlOpts) {
-    container.environment.push({ name: 'FALCONCTL_OPTS', value: cfg.falconctlOpts });
+    container.environment.push({ name: 'FALCONCTL_OPT_OPTS', value: cfg.falconctlOpts });
+  }
+
+  // When app containers use readonlyRootFilesystem, mount writable ephemeral volumes
+  // for the paths the Falcon sensor writes to at runtime.
+  if (needsTmpVolumes) {
+    container.mountPoints = [
+      { sourceVolume: 'falcon-tmp-private', containerPath: '/tmp/CrowdStrike-private', readOnly: false },
+      { sourceVolume: 'falcon-tmp',         containerPath: '/tmp/CrowdStrike',         readOnly: false },
+    ];
   }
 
   return container;
 }
 
-function injectFalconVolume(container, cfg) {
-  const volumeName = 'falconshm';
+function injectFalconVolume(container, cfg, needsTmpVolumes) {
   const updated = { ...container };
 
-  updated.mountPoints = [
-    ...(container.mountPoints || []),
-    {
-      sourceVolume: volumeName,
-      containerPath: '/opt/CrowdStrike',
-      readOnly: true,
-    },
-  ];
-
-  // Add depends-on so app containers wait for the sensor init to complete
+  // Add depends-on so app containers wait for the sensor sidecar to start
   updated.dependsOn = [
     ...(container.dependsOn || []),
     {
       containerName: cfg.containerName || 'falcon-sensor',
-      condition: 'COMPLETE',
+      condition: 'START',
     },
   ];
+
+  // For containers with a read-only root filesystem, punch writable mounts through
+  // for the specific paths the Falcon sensor needs at runtime.
+  if (needsTmpVolumes && container.readonlyRootFilesystem) {
+    updated.mountPoints = [
+      ...(container.mountPoints || []),
+      { sourceVolume: 'falcon-tmp-private', containerPath: '/tmp/CrowdStrike-private', readOnly: false },
+      { sourceVolume: 'falcon-tmp',         containerPath: '/tmp/CrowdStrike',         readOnly: false },
+    ];
+  }
 
   return updated;
 }
 
-function buildRegisterInput(original, updatedContainers, cfg) {
-  const volumeName = 'falconshm';
-
+function buildRegisterInput(original, updatedContainers, cfg, needsTmpVolumes) {
   // Copy fields that are valid for register-task-definition
   const allowed = [
     'family',
@@ -227,11 +231,17 @@ function buildRegisterInput(original, updatedContainers, cfg) {
 
   input.containerDefinitions = updatedContainers;
 
-  // Add the shared volume
-  input.volumes = [
-    ...(original.volumes || []).filter(v => v.name !== volumeName),
-    { name: volumeName },
-  ];
+  // Build volumes list — preserve originals, add ephemeral tmp volumes if needed
+  const originalVolumes = (original.volumes || []);
+  if (needsTmpVolumes) {
+    input.volumes = [
+      ...originalVolumes.filter(v => v.name !== 'falcon-tmp-private' && v.name !== 'falcon-tmp'),
+      { name: 'falcon-tmp-private' },
+      { name: 'falcon-tmp' },
+    ];
+  } else if (originalVolumes.length > 0) {
+    input.volumes = originalVolumes;
+  }
 
   return input;
 }
