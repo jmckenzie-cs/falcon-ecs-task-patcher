@@ -49,6 +49,13 @@ function spawnAws(args, cfg) {
 export async function patchTaskDefinition(job, cfg) {
   const { taskDefArn } = job;
 
+  if (!cfg.falconSensorImage) {
+    throw new Error('Falcon Sensor Image URI is not configured — open Settings and set it before patching.');
+  }
+  if (!cfg.falconCid) {
+    throw new Error('Falcon CID is not configured — open Settings and set it before patching.');
+  }
+
   appendLog(job, `[patcher] Describing task definition: ${taskDefArn}`);
 
   // Fetch current task definition
