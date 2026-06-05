@@ -76,6 +76,7 @@ async function runPatchingUtility(taskDef, cfg, log = () => {}) {
   // Build docker args
   const args = [
     'run', '--rm',
+    '--platform', 'linux/amd64',
     '-v', `${tmpDir}:/var/run/spec`,
     cfg.falconSensorImage,
     '-cid', cfg.falconCid,
