@@ -120,6 +120,20 @@ export async function patchTaskDefinition(job, cfg) {
   appendLog(job, `[patcher] Patch complete. New ARN: ${newTd.taskDefinitionArn}`);
 }
 
+// Pure patch — works on a plain task definition object, no AWS calls.
+// Returns the register-task-definition input object (patched task def).
+export function applyPatch(taskDefinition, cfg) {
+  const alreadyPatched = taskDefinition.containerDefinitions.some(
+    c => c.name === (cfg.containerName || 'falcon-sensor'),
+  );
+  if (alreadyPatched) {
+    throw new Error(`Task definition already contains a container named "${cfg.containerName || 'falcon-sensor'}".`);
+  }
+  const falconContainer = buildFalconContainer(cfg, taskDefinition);
+  const updatedContainers = [falconContainer, ...taskDefinition.containerDefinitions.map(c => injectFalconVolume(c, cfg))];
+  return buildRegisterInput(taskDefinition, updatedContainers, cfg);
+}
+
 function buildFalconContainer(cfg, original) {
   // Determine shared memory volume name
   const volumeName = 'falconshm';

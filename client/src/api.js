@@ -70,7 +70,16 @@ export async function fetchTaskDefinitionFamilies() {
   return res.json();
 }
 
-export async function fetchTaskDefinitions(family) {
+export async function patchTaskDefFile(taskDefinition) {
+  const res = await fetch('/api/ecs/patch-file', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ taskDefinition }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Failed to patch file');
+  return data.patched;
+}
   const res = await fetch(`/api/ecs/task-definitions?family=${encodeURIComponent(family)}`);
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));

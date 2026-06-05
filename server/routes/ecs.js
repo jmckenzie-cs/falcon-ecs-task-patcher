@@ -1,6 +1,7 @@
 import express from 'express';
 import { spawn } from 'child_process';
 import { readConfig } from '../config.js';
+import { applyPatch } from '../patcher.js';
 
 const router = express.Router();
 
@@ -132,6 +133,26 @@ router.get('/task-definitions', (req, res) => {
       })));
     });
   });
+});
+
+// Patch a task definition JSON file in-memory — no AWS credentials needed.
+// Accepts: { taskDefinition: { ... } }  (the object from describe-task-definition)
+// Returns: the patched register-task-definition input as JSON for download.
+router.post('/patch-file', express.json({ limit: '1mb' }), (req, res) => {
+  const { taskDefinition } = req.body;
+  if (!taskDefinition || !taskDefinition.containerDefinitions) {
+    return res.status(400).json({ error: 'Request body must contain a taskDefinition object with containerDefinitions' });
+  }
+  const cfg = readConfig();
+  if (!cfg.falconSensorImage) {
+    return res.status(400).json({ error: 'falconSensorImage not configured — open Settings and set the Falcon Sensor Image URI' });
+  }
+  try {
+    const patched = applyPatch(taskDefinition, cfg);
+    res.json({ patched });
+  } catch (err) {
+    res.status(422).json({ error: err.message });
+  }
 });
 
 export default router;
