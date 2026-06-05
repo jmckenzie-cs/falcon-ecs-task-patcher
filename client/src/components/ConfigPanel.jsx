@@ -8,6 +8,7 @@ const FIELDS = [
   { key: 'falconSensorImage', label: 'Falcon Sensor Image URI', type: 'text', placeholder: 'registry.crowdstrike.com/falcon-container/...' },
   { key: 'containerName', label: 'Falcon Container Name', type: 'text', placeholder: 'falcon-sensor' },
   { key: 'falconctlOpts', label: 'falconctl Options', type: 'text', placeholder: 'Optional extra flags' },
+  { key: 'falconCloud', label: 'Falcon Cloud Region', type: 'text', placeholder: 'us-1 (default)' },
   { key: 'awsRegion', label: 'AWS Region', type: 'text', placeholder: 'us-east-1' },
   { key: 'awsProfile', label: 'AWS Profile', type: 'text', placeholder: 'leave blank for default' },
   { key: 'concurrency', label: 'Concurrency', type: 'number' },
@@ -39,7 +40,7 @@ export default function ConfigPanel({ onClose }) {
     setDetecting(true);
     setDetectError('');
     try {
-      const detected = await detectFalconConfig(id, secret);
+    const detected = await detectFalconConfig(id, secret, form.falconCloud);
       setForm(f => ({
         ...f,
         falconCid: detected.falconCid ?? f.falconCid,

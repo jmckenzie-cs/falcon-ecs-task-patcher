@@ -7,7 +7,8 @@ const router = express.Router();
 
 function buildArgs(base, cfg) {
   const { awsRegion, awsProfile } = cfg;
-  const args = [...base, '--region', awsRegion, '--output', 'json'];
+  const args = [...base, '--output', 'json'];
+  if (awsRegion) args.push('--region', awsRegion);
   if (awsProfile) args.push('--profile', awsProfile);
   return args;
 }
@@ -25,7 +26,7 @@ function spawnAws(args, res, onSuccess) {
       return res.status(500).json({ error: stderr.trim() || 'aws CLI command failed' });
     }
     try {
-      onSuccess(JSON.parse(stdout));
+      onSuccess(stdout.trim() ? JSON.parse(stdout) : {});
     } catch {
       res.status(500).json({ error: 'Failed to parse AWS CLI output' });
     }

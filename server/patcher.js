@@ -13,7 +13,8 @@ export function appendLog(job, line) {
 
 function spawnAws(args, cfg) {
   const { awsRegion, awsProfile } = cfg;
-  const fullArgs = [...args, '--region', awsRegion, '--output', 'json'];
+  const fullArgs = [...args, '--output', 'json'];
+  if (awsRegion) fullArgs.push('--region', awsRegion);
   if (awsProfile) fullArgs.push('--profile', awsProfile);
 
   return new Promise((resolve, reject) => {
@@ -29,9 +30,9 @@ function spawnAws(args, cfg) {
         reject(new Error(stderr.trim() || `aws CLI exited with code ${code}`));
       } else {
         try {
-          resolve(JSON.parse(stdout));
+          resolve(stdout.trim() ? JSON.parse(stdout) : {});
         } catch {
-          reject(new Error('Failed to parse AWS CLI output'));
+          reject(new Error(`Failed to parse AWS CLI output: ${stdout.slice(0, 200)}`));
         }
       }
     });

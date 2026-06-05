@@ -1,8 +1,8 @@
-export async function detectFalconConfig(falconClientId, falconClientSecret) {
+export async function detectFalconConfig(falconClientId, falconClientSecret, falconCloud) {
   const res = await fetch('/api/config/detect', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ falconClientId, falconClientSecret }),
+    body: JSON.stringify({ falconClientId, falconClientSecret, falconCloud }),
   });
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || 'Detection failed');
