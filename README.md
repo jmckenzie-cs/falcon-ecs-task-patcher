@@ -12,7 +12,7 @@ For each task definition you submit, the patcher:
 4. Registers a new task definition revision with these changes
 5. Copies any existing tags to the new revision
 
-The patched task definition uses the [Falcon Container sidecar injection](https://falcon.crowdstrike.com/documentation) pattern: the init container populates `/opt/CrowdStrike` via a shared `falconshm` volume, and all other containers mount that volume read-only.
+The patched task definition uses the [Falcon Container sidecar injection](https://falcon.crowdstrike.com/documentation) pattern: the init container copies Falcon binaries into a shared `crowdstrike-falcon-volume` at `/tmp/CrowdStrike`, and all other containers mount that volume read-only and run via a wrapped entrypoint.
 
 ## Features
 
@@ -96,32 +96,73 @@ Given a task definition with containers `[web, worker]`, the patcher registers a
 
 ```
 containers:
-  - name: falcon-sensor          # NEW — init container, essential: false
+  - name: crowdstrike-falcon-init-container   # NEW — copies Falcon binaries, exits 0
     image: <falcon-sensor-image>
-    command: [falconctl, install]
+    essential: false
+    entryPoint: [copy binaries to /tmp/CrowdStrike, set permissions]
     mountPoints:
-      - sourceVolume: falconshm
-        containerPath: /opt/CrowdStrike
-    environment:
-      - FALCONCTL_OPT_CID: <your-cid>
+      - sourceVolume: crowdstrike-falcon-volume
+        containerPath: /tmp/CrowdStrike
 
-  - name: web                    # EXISTING — unchanged, plus:
-    mountPoints:
-      - sourceVolume: falconshm
-        containerPath: /opt/CrowdStrike
-        readOnly: true
+  - name: web                                 # EXISTING — modified in-place
     dependsOn:
-      - containerName: falcon-sensor
+      - containerName: crowdstrike-falcon-init-container
         condition: COMPLETE
+    entryPoint:
+      - /tmp/CrowdStrike/rootfs/lib64/ld-linux-x86-64.so.2  # Falcon wrapper
+      - ...
+      - /tmp/CrowdStrike/rootfs/entrypoint-ecs.sh
+      - <original-entrypoint>                               # preserved
+    environment:
+      - FALCONCTL_OPTS: --cid=<your-cid>
+    linuxParameters:
+      capabilities:
+        add: [SYS_PTRACE]
+    mountPoints:
+      - sourceVolume: crowdstrike-falcon-volume
+        containerPath: /tmp/CrowdStrike
+        readOnly: true
 
-  - name: worker                 # EXISTING — same treatment
+  - name: worker                              # EXISTING — same treatment
     ...
 
 volumes:
-  - name: falconshm              # NEW shared volume
+  - name: crowdstrike-falcon-volume           # NEW shared ephemeral volume
 ```
 
-## Job Lifecycle
+### readonlyRootFilesystem support
+
+If any app container has `readonlyRootFilesystem: true`, the patching utility automatically detects this and injects additional per-container writable mounts so the Falcon sensor can write to `/tmp/CrowdStrike-private` at runtime:
+
+```
+  - name: web
+    mountPoints:
+      - sourceVolume: crowdstrike-falcon-volume
+        containerPath: /tmp/CrowdStrike
+        readOnly: true
+      - sourceVolume: crowdstrike-private-web    # NEW — ReadOnly-specific
+        containerPath: /tmp/CrowdStrike-private
+        readOnly: false
+
+volumes:
+  - name: crowdstrike-falcon-volume
+  - name: crowdstrike-private-web               # NEW — per-container ephemeral
+```
+
+See [`examples/readonly-pre-patch.json`](examples/readonly-pre-patch.json) and [`examples/readonly-post-patch.json`](examples/readonly-post-patch.json) for a complete before/after reference.
+
+## Examples
+
+The [`examples/`](examples/) directory contains reference task definitions showing the before and after state for a container with `readonlyRootFilesystem: true`:
+
+| File | Description |
+|---|---|
+| [`readonly-pre-patch.json`](examples/readonly-pre-patch.json) | Task definition before patching — app container with `readonlyRootFilesystem: true` and app-specific writable mounts |
+| [`readonly-post-patch.json`](examples/readonly-post-patch.json) | Task definition after patching — Falcon init container, entrypoint wrapping, `SYS_PTRACE`, and the additional `crowdstrike-private-<container>` volume for the readonly filesystem case |
+
+All account IDs, CIDs, and image URIs are replaced with placeholders (e.g. `<AWS_ACCOUNT_ID>`, `<FALCON_CID>`).
+
+
 
 ```
 pending → running → done
